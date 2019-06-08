@@ -1,0 +1,232 @@
+//Header Files to be used
+#include<ESP8266WiFi.h>
+#include <NewPing.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+#include "DHT.h"
+
+//Components definition
+#define fan D0
+#define In D1 // Outside gate (calculate people going outside)
+#define Out D2 // Inside gate (calculate people coming inside)
+#define Bell D3   //Buzzer in series, works as pull-up as well
+#define LDR D4    //To chck level of light in room
+DHT dht(D5,DHT11);    //To measure temperature and humidity
+#define red D6     // Red Terminal of RGB Led
+#define green D7   // Green Terminal of RGB Led
+#define blue D8    // Blue Terminal of RGB Led
+
+//Adafruit.io details
+#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVERPORT  1883
+#define AIO_USERNAME  "Your Username"
+#define AIO_KEY  "Your Key"
+
+WiFiClient client;
+
+//To connect to IFTTT
+String MakerIFTTT_Key ;
+String MakerIFTTT_Event;
+char *append_str(char *here, String s) {  int i=0; while (*here++ = s[i]){i++;};return here-1;}
+char *append_ul(char *here, unsigned long u) { char buf[20]; return append_str(here, ultoa(u, buf, 10));}
+char post_rqst[256];char *p;char *content_length_here;char *json_start;int compi;
+
+//HC-SR04 declarations
+NewPing sonar(In, In );
+NewPing sonar2(Out, Out );
+
+//To connect to Adafruit server
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+Adafruit_MQTT_Subscribe Light = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/Light");
+
+unsigned long b_on=0;   //Last time bell was pressed
+unsigned long t;      //Last time someone came in/out
+int inside=0;       //People inside room
+int x;int y;      
+int cf=0,cl=0;      //Light and fan on or off
+int r,g,b;        //Parameters of light i.e. RGB led
+bool net=false;   //Use internet controls (Light colour choosen from there only)
+float hum,hic,temp;   //DHT11 sensor results
+String Led,val;
+
+void Wifi()           //Connect to Wifi
+{
+  WiFi.disconnect();
+  delay(1000);
+  Serial.println("START");
+  WiFi.begin("Name","Password");     //Change to your credentials
+  while(!(WiFi.status() == WL_CONNECTED))
+  {
+    delay(300);
+    Serial.print("...");
+  }
+  Serial.println("Connected");
+  Serial.println("Your IP is ");
+  Serial.print(WiFi.localIP().toString());
+}
+
+void Bell_notification()    //Send notifiacation to phone when doorbell pressed using IFTTT
+{
+  if (client.connect("maker.ifttt.com",80)) {
+    MakerIFTTT_Key ="Your Key";
+    MakerIFTTT_Event ="Doorbell";
+    p = post_rqst;
+    p = append_str(p, "POST /trigger/");
+    p = append_str(p, MakerIFTTT_Event);
+    p = append_str(p, "/with/key/");
+    p = append_str(p, MakerIFTTT_Key);
+    p = append_str(p, " HTTP/1.1\r\n");
+    p = append_str(p, "Host: maker.ifttt.com\r\n");
+    p = append_str(p, "Content-Type: application/json\r\n");
+    p = append_str(p, "Content-Length: ");
+    content_length_here = p;
+    p = append_str(p, "NN\r\n");
+    p = append_str(p, "\r\n");
+    json_start = p;
+    p = append_str(p, "{\"value1\":\"");
+    p = append_str(p, "");
+    p = append_str(p, "\",\"value2\":\"");
+    p = append_str(p, "");
+    p = append_str(p, "\",\"value3\":\"");
+    p = append_str(p, "");
+    p = append_str(p, "\"}");
+
+    compi= strlen(json_start);
+    content_length_here[0] = '0' + (compi/10);
+    content_length_here[1] = '0' + (compi%10);
+    client.print(post_rqst);
+  }
+}
+
+void setup() 
+{
+  Serial.begin(9600);
+  Wifi();     //Connect to Wifi
+  pinMode(Bell,INPUT);        //To read pressing of bell
+  t=millis();                 //Get current time for board 
+  mqtt.subscribe(&Light);     //Subscribe to Light feed to control colour
+  MQTT_connect();             //Connect to MQTT server on of adafruit
+}
+
+void loop()
+{
+  if(mqtt.connected()==0)     //If mqtt connection failed, reconnect
+  {
+    MQTT_connect();
+  }
+ 
+  if(digitalRead(Bell)==0 && b_on+2000<millis())  //Read if bell pressed and time between two press is atleast 2 sec
+  {
+     b_on=millis();                               //Update time when bell was pressed
+     Serial.println("Bell pressed");
+     Bell_notification();                          //Call function to send notification
+  }
+  
+  unsigned int us = sonar.ping();                   // Send ping, get ping time in microseconds (uS).
+  unsigned int us2 = sonar2.ping(); 
+  x=us / US_ROUNDTRIP_CM;
+  if(x<20 && (t+500<millis()))
+  {
+    inside=inside-1;
+    t=millis();
+  }
+  y=us2 / US_ROUNDTRIP_CM;
+  if(y<20 && (t+500<millis()))
+  {
+    inside=inside+1;
+    t=millis();
+  }
+  
+  hum = dht.readHumidity();
+  temp = dht.readTemperature();
+  hic = dht.computeHeatIndex(temp, hum, false);
+  if(net==false)
+  {
+    ins();      //Work as per room conditions
+  }
+//  if(net==true)
+//  {
+//    out();      //Work as per dashboard on adafruit.io
+//  }
+}
+
+void ins()
+{
+  if(inside>0)
+  {
+    if(cl!=1)
+    {
+//    digitalWrite(light,HIGH);
+      Led=((char *)Light.lastread);
+      Serial.println("Light:    ");
+      Serial.println(Led);
+      r=16*cal(Led[1])+cal(Led[2]);
+      g=16*cal(Led[3])+cal(Led[4]);
+      b=16*cal(Led[5])+cal(Led[6]);
+      Colour(r,g,b);
+      cl=1;
+    }
+    if(hic>22)
+    {
+      if(cf!=1)
+      {
+        digitalWrite(fan,HIGH);
+        cf=1;
+      }
+    }
+    else
+    {
+      cl=0;
+      digitalWrite(fan,LOW);
+    }
+  }
+  else
+  {
+    if(cl!=0)
+    {
+      cl=0;
+//      digitalWrite(light,LOW);
+      Colour(0,0,0);
+    }
+    if(cf!=0)
+    {
+      cf=0;
+      digitalWrite(fan,LOW);
+    }
+  }
+}
+
+void MQTT_connect()
+{
+    if (mqtt.connected())
+    {
+      return;
+    }
+int8_t ret;
+    Serial.println("Coneecting to MQTT");
+     uint8_t retries = 3;
+  while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
+       Serial.println(mqtt.connectErrorString(ret));
+       Serial.println("Retrying MQTT connection in 5 seconds...");
+       mqtt.disconnect();
+       delay(5000);  // wait 5 seconds
+       retries--;
+       if (retries == 0) {
+         // basically die and wait for WDT to reset me
+         while (1);
+       }
+  }
+  Serial.println("MQTT Connected!");    
+}
+
+void Colour(int r, int g, int b)
+{
+  analogWrite(D4,r);
+  analogWrite(D5,g);
+  analogWrite(D6,b);
+}
+
+int cal(char c)
+{
+  return c-'0';
+}
